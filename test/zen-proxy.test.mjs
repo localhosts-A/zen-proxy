@@ -9,6 +9,11 @@ import { fileURLToPath } from "node:url"
 // Must be set before importing the module (CONFIG_PATH is computed at load).
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "zen-proxy-test-"))
 process.env.ZEN_PROXY_CONFIG = path.join(tmpDir, "zen-proxy.json")
+// Isolate from the developer's real opencode.db anonymous key so
+// auth tests are deterministic (otherwise loadLocalZenKey would return a real sk-...).
+process.env.OPENCODE_DB = path.join(tmpDir, "nonexistent-opencode.db")
+process.env.HOME = tmpDir
+process.env.USERPROFILE = tmpDir
 delete process.env.PORT
 delete process.env.HOST
 delete process.env.ZEN_URL
@@ -231,37 +236,54 @@ describe("ip handling", () => {
   })
 
   test("zenHeaders sends x-real-ip for public IPs, omits for loopback", () => {
-    const pub = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
+    const pub = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public").headers
     assert.equal(pub["x-real-ip"], "8.8.8.8")
     assert.equal(pub["user-agent"], zp.config.ua)
-    const loop = zp.zenHeaders(mockReq({ remoteAddress: "127.0.0.1" }), "Bearer public")
+    const loop = zp.zenHeaders(mockReq({ remoteAddress: "127.0.0.1" }), "Bearer public").headers
     assert.equal(loop["x-real-ip"], undefined)
   })
 
   test("zenHeaders forwards x-opencode-* headers", () => {
-    const h = zp.zenHeaders(mockReq({ headers: { "x-opencode-session": "sess-1" } }), "Bearer public")
-    assert.equal(h["x-opencode-session"], "sess-1")
+    const valid = zp.genOfficialId("ses")
+    const h = zp.zenHeaders(mockReq({ headers: { "x-opencode-session": valid } }), "Bearer public").headers
+    assert.equal(h["x-opencode-session"], valid)
   })
 })
 
 describe("session injection", () => {
   test("zenHeaders injects a synthetic session when none is sent", () => {
-    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public").headers
     assert.ok(h["x-opencode-session"], "session header present")
     assert.ok(h["x-opencode-session"].startsWith("ses_"), `session looks like opencode: ${h["x-opencode-session"]}`)
+    // official 2.x headers are also injected
+    assert.equal(h["x-opencode-client"], "cli")
+    assert.ok(h["x-session-affinity"], "affinity present")
+    assert.ok(h["x-session-id"], "session-id present")
   })
 
   test("client-provided session is passed through untouched", () => {
+    const valid = zp.genOfficialId("ses")
+    const h = zp.zenHeaders(
+      mockReq({ remoteAddress: "8.8.8.8", headers: { "x-opencode-session": valid } }),
+      "Bearer public",
+    ).headers
+    assert.equal(h["x-opencode-session"], valid)
+  })
+
+  test("invalid client session is replaced with an official one", () => {
     const h = zp.zenHeaders(
       mockReq({ remoteAddress: "8.8.8.8", headers: { "x-opencode-session": "real-session-1" } }),
       "Bearer public",
-    )
-    assert.equal(h["x-opencode-session"], "real-session-1")
+    ).headers
+    assert.notEqual(h["x-opencode-session"], "real-session-1")
+    assert.match(h["x-opencode-session"], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
   })
 
   test("injectSession=false disables injection", () => {
     zp.saveConfig({ injectSession: false })
-    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public")
+    const h = zp.zenHeaders(mockReq({ remoteAddress: "8.8.8.8" }), "Bearer public").headers
+    // when disabled, no synthetic session is minted (headers still carry
+    // whatever the client sent, which here is nothing)
     assert.equal(h["x-opencode-session"], undefined)
   })
 
@@ -271,7 +293,7 @@ describe("session injection", () => {
     assert.equal(a1, a2, "same client → same session")
     const b = zp.sessionFor(mockReq({ remoteAddress: "9.9.9.9" })).value
     assert.notEqual(a1, b, "different client → different session")
-    assert.match(a1, /^ses_[0-9a-f]{26}$/)
+    assert.match(a1, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     assert.ok(zp.sessionFor(mockReq()).injected, "local client gets an injected id")
   })
 })
@@ -339,30 +361,30 @@ describe("effectiveDefault", () => {
 
 describe("auto-UA tracking", () => {
   test("refreshUA adopts a newer opencode version and persists it", async () => {
-    zp.saveConfig({ autoUA: true, ua: "opencode/1.18.30" })
+    zp.saveConfig({ autoUA: true, ua: "opencode/latest/1.18.30/cli" })
     globalThis.fetch = routeFetch([
-      ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
+      ["registry.npmjs.org/@opencode/cli/latest", jsonResponse({ version: "9.9.9" })],
     ])
     await zp.refreshUA(true)
-    assert.equal(zp.config.ua, "opencode/9.9.9", "UA must track the latest opencode version")
+    assert.equal(zp.config.ua, "opencode/latest/9.9.9/cli", "UA must track the latest opencode version")
   })
 
   test("refreshUA leaves custom User-Agents untouched", async () => {
     zp.saveConfig({ autoUA: true, ua: "my-agent/1.0" })
     globalThis.fetch = routeFetch([
-      ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
+      ["registry.npmjs.org/@opencode/cli/latest", jsonResponse({ version: "9.9.9" })],
     ])
     await zp.refreshUA(true)
     assert.equal(zp.config.ua, "my-agent/1.0", "custom UA must not be overwritten")
   })
 
   test("refreshUA is a no-op when autoUA is disabled", async () => {
-    zp.saveConfig({ autoUA: false, ua: "opencode/1.18.30" })
+    zp.saveConfig({ autoUA: false, ua: "opencode/latest/1.18.30/cli" })
     let hit = false
     globalThis.fetch = async () => { hit = true; return jsonResponse({ version: "9.9.9" }) }
     await zp.refreshUA(true)
     assert.equal(hit, false, "must not fetch when disabled")
-    assert.equal(zp.config.ua, "opencode/1.18.30")
+    assert.equal(zp.config.ua, "opencode/latest/1.18.30/cli")
   })
 })
 
